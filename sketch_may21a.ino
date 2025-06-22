@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <FastLED.h>
+#include <Wire.h>
+#include "MAX30100_PulseOximeter.h"
 
 // --- CONFIGURAÇÕES WI-FI ---
 const char* ssid = "Inteli.Iot";
@@ -8,13 +10,18 @@ const char* password = "@Intelix10T#";
 
 WebServer server(80);
 
-// --- LED, SENSOR e BOTÃO ---
+// --- LED e BOTÃO ---
 #define LED_PIN     25
 #define NUM_LEDS    4
-#define SENSOR_PIN  35
 #define BTN_PIN     32
 #define BTN_PIN2    27
 CRGB leds[NUM_LEDS];
+
+// --- MAX30100 ---
+PulseOximeter pox;
+#define REPORTING_PERIOD_MS 1000
+unsigned long lastBeatTime = 0;
+bool sensorInitialized = false;
 
 // --- VARIÁVEIS DE MEDIÇÃO ---
 unsigned long startTime = 0;
@@ -24,143 +31,201 @@ int bpmSum = 0;
 int bpmCount = 0;
 int bpmFinal = 0;
 int ultimoBPM = 0;
-unsigned long lastBeatTime = 0;
-int threshold = 515;
 
 // --- VARIÁVEIS DO BOTÃO ---
 unsigned long lastButtonPress = 0;
 const unsigned long debounceDelay = 800;
-bool ledsOn = true;
 int estado = 0;
 
-// --- BUFFER DE BPMs PARA GRÁFICO ---
+// --- BUFFER DE BPMs ---
 #define MAX_POINTS 50
 int bpmBuffer[MAX_POINTS] = {0};
 int bpmIndex = 0;
 
-// --- SETUP ---
-void setup() {
-  Serial.begin(115200);
-  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-  FastLED.clear();
-  pinMode(SENSOR_PIN, INPUT);
-  pinMode(BTN_PIN, INPUT_PULLUP);  // Alterado para INPUT_PULLUP
-  pinMode(BTN_PIN2, INPUT_PULLUP);  // Alterado para INPUT_PULLUP
+void onBeatDetected() {
+    unsigned long currentTime = millis();
+    if (currentTime - lastBeatTime > 300) { // Filtro para evitar detecções muito próximas
+        int beatInterval = currentTime - lastBeatTime;
+        lastBeatTime = currentTime;
+        int bpm = 60000 / beatInterval;
 
+        // Filtro para valores plausíveis de BPM (40-180)
+        if (bpm >= 40 && bpm <= 180) {
+            bpmSum += bpm;
+            bpmCount++;
+            ultimoBPM = bpm;
 
-  WiFi.begin(ssid, password);
-  Serial.print("Conectando ao Wi-Fi");
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
-    Serial.print(".");
-  }
-  Serial.print("\nConectado com IP: ");
-  Serial.println(WiFi.localIP());
+            bpmBuffer[bpmIndex] = bpm;
+            bpmIndex = (bpmIndex + 1) % MAX_POINTS;
 
-  // Rotas do servidor (mantidas iguais)
-  server.on("/", []() { server.send(200, "text/html", getHTMLPage()); });
-  server.on("/bpm", []() { server.send(200, "text/plain", String(ultimoBPM)); });
-  server.on("/bpmdata", []() {
-    String json = "[";
-    for (int i = 0; i < MAX_POINTS; i++) {
-      json += String(bpmBuffer[(bpmIndex + i) % MAX_POINTS]);
-      if (i < MAX_POINTS - 1) json += ",";
+            Serial.print("♥ Batimento detectado! BPM: ");
+            Serial.println(bpm);
+        }
     }
-    json += "]";
-    server.send(200, "application/json", json);
-  });
-
-  server.begin();
-  startTime = millis();
 }
 
-// --- LOOP PRINCIPAL ---
-void loop() {
-  server.handleClient();
-
-  // Leitura do botão com debounce
-    if (digitalRead(BTN_PIN) == LOW && millis() - lastButtonPress > debounceDelay) {
-    lastButtonPress = millis();
-    estado++;
+void initializeSensor() {
+    Serial.println("Inicializando sensor MAX30100...");
     
-    if (estado == 1) {
-      ledsEstaticos();
+    if (!pox.begin()) {
+        Serial.println("FALHA: Não foi possível inicializar o sensor MAX30100");
+        Serial.println("Verifique as conexões e tente novamente");
+        sensorInitialized = false;
+        return;
     }
-    else if (estado == 2) {
-      turnOffLeds();
+    
+    pox.setOnBeatDetectedCallback(onBeatDetected);
+    pox.setIRLedCurrent(MAX30100_LED_CURR_7_6MA); // Ajuste a corrente conforme necessário
+    
+    Serial.println("Sensor MAX30100 inicializado com sucesso!");
+    sensorInitialized = true;
+}
+
+void setup() {
+    Serial.begin(115200);
+    while (!Serial); // Aguarda a porta serial estar pronta
+    
+    // Inicializa os LEDs
+    FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
+    FastLED.clear();
+    FastLED.show();
+    
+    // Configura os botões
+    pinMode(BTN_PIN, INPUT_PULLUP);
+    pinMode(BTN_PIN2, INPUT_PULLUP);
+    
+    // Inicializa o sensor
+    Wire.begin();
+    initializeSensor();
+    
+    // Conecta ao Wi-Fi
+    WiFi.begin(ssid, password);
+    Serial.print("Conectando ao Wi-Fi");
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+        Serial.print(".");
     }
-    else if (estado>2){
-      estado = 0;
+    Serial.println("\nConectado com IP: " + WiFi.localIP().toString());
+    
+    // Configura as rotas do servidor
+    server.on("/", []() { server.send(200, "text/html", getHTMLPage()); });
+    server.on("/bpm", []() { server.send(200, "text/plain", String(ultimoBPM)); });
+    server.on("/bpmdata", []() {
+        String json = "[";
+        for (int i = 0; i < MAX_POINTS; i++) {
+            json += String(bpmBuffer[(bpmIndex + i) % MAX_POINTS]);
+            if (i < MAX_POINTS - 1) json += ",";
+        }
+        json += "]";
+        server.send(200, "application/json", json);
+    });
+    
+    server.begin();
+    startTime = millis();
+    
+    // Pisca os LEDs para indicar inicialização
+    for (int i = 0; i < 3; i++) {
+        fill_solid(leds, NUM_LEDS, CRGB::Blue);
+        FastLED.show();
+        delay(200);
+        FastLED.clear();
+        FastLED.show();
+        delay(200);
     }
-  }
+}
 
-  if (digitalRead(BTN_PIN2) == LOW && millis() - lastButtonPress > debounceDelay) {
-    lastButtonPress = millis();
-      ESP.restart();
-  }
-
-  // Restante da lógica original (sensor, medição, etc.)
-  int sensorValue = analogRead(SENSOR_PIN);
-  
-  if (sensorValue > threshold && millis() - lastBeatTime > 300) {
-    unsigned long currentTime = millis();
-    int beatInterval = currentTime - lastBeatTime;
-    lastBeatTime = currentTime;
-    int bpm = 60000 / beatInterval;
-
-    bpmSum += bpm;
-    bpmCount++;
-    ultimoBPM = bpm;
-
-    bpmBuffer[bpmIndex] = bpm;
-    bpmIndex = (bpmIndex + 1) % MAX_POINTS;
-
-    Serial.print("BPM detectado: ");
-    Serial.println(bpm);
-  }
-
-  if (isMeasuring && millis() - startTime >= measureDuration) {
-    bpmFinal = bpmCount > 0 ? bpmSum / bpmCount : 0;
-    isMeasuring = false;
-    Serial.print("BPM Final (média): ");
-    Serial.println(bpmFinal);
-  }
-
-  if (!isMeasuring && estado == 0) {  // Só anima se os LEDs estiverem ligados
-    smoothBlinkLeds(bpmFinal);
-  }
+void loop() {
+    server.handleClient();
+    
+    // Atualiza o sensor se estiver inicializado
+    if (sensorInitialized) {
+        pox.update();
+        
+        // Exibe informações do sensor periodicamente
+        static unsigned long lastReport = 0;
+        if (millis() - lastReport > REPORTING_PERIOD_MS) {
+            Serial.print("BPM: ");
+            Serial.print(pox.getHeartRate());
+            Serial.print(" | SpO2: ");
+            Serial.print(pox.getSpO2());
+            Serial.println("%");
+            lastReport = millis();
+        }
+    }
+    
+    // Controle dos botões
+    if (digitalRead(BTN_PIN) == LOW && millis() - lastButtonPress > debounceDelay) {
+        lastButtonPress = millis();
+        estado++;
+        
+        if (estado == 1) {
+            ledsEstaticos();
+        }
+        else if (estado == 2) {
+            turnOffLeds();
+        }
+        else if (estado > 2) {
+            estado = 0;
+        }
+    }
+    
+    if (digitalRead(BTN_PIN2) == LOW && millis() - lastButtonPress > debounceDelay) {
+        lastButtonPress = millis();
+        Serial.println("Reiniciando ESP32...");
+        ESP.restart();
+    }
+    
+    // Finaliza a medição após 10 segundos
+    if (isMeasuring && millis() - startTime >= measureDuration) {
+        bpmFinal = bpmCount > 0 ? bpmSum / bpmCount : 0;
+        isMeasuring = false;
+        Serial.print("Média de BPM: ");
+        Serial.println(bpmFinal);
+    }
+    
+    // Anima os LEDs se não estiver medindo e no estado padrão
+    if (!isMeasuring && estado == 0) {
+        smoothBlinkLeds(bpmFinal > 0 ? bpmFinal : 60); // Usa 60 BPM como padrão se nenhum for detectado
+    }
+    
+    // Se o sensor falhou, tenta reinicializar a cada 5 segundos
+    static unsigned long lastSensorRetry = 0;
+    if (!sensorInitialized && millis() - lastSensorRetry > 5000) {
+        initializeSensor();
+        lastSensorRetry = millis();
+    }
 }
 
 void turnOffLeds() {
-  fill_solid(leds, NUM_LEDS, CRGB::Black);
-  FastLED.show();
+    fill_solid(leds, NUM_LEDS, CRGB::Black);
+    FastLED.show();
 }
 
 void ledsEstaticos() {
-  fill_solid(leds, NUM_LEDS, CRGB::Red);
-  FastLED.show();
+    fill_solid(leds, NUM_LEDS, CRGB::Red);
+    FastLED.show();
 }
-// --- PISCAR LED ---
+
 void smoothBlinkLeds(int bpm) {
-  if (bpm == 0 || estado != 0) return;
+    if (bpm == 0 || estado != 0) return;
 
-  int duration = 60000 / bpm / 2;
-  for (int b = 0; b <= 255; b += 5) {
-    fill_solid(leds, NUM_LEDS, CRGB(b, 0, 0));
-    FastLED.show();
-    delay((duration / 51) * 1.7);
-  }
+    int duration = 60000 / bpm / 2; // Metade do período para subir e descer
+    for (int b = 0; b <= 255; b += 5) {
+        fill_solid(leds, NUM_LEDS, CRGB(b, 0, 0));
+        FastLED.show();
+        delay((duration / 51) * 1.7);
+    }
 
-  for (int b = 255; b >= 0; b -= 5) {
-    fill_solid(leds, NUM_LEDS, CRGB(b, 0, 0));
-    FastLED.show();
-    delay((duration / 51) * 1.7);
-  }
+    for (int b = 255; b >= 0; b -= 5) {
+        fill_solid(leds, NUM_LEDS, CRGB(b, 0, 0));
+        FastLED.show();
+        delay((duration / 51) * 1.7);
+    }
 }
 
 // HTML (mantido igual)
 String getHTMLPage() {
-  return R"rawliteral(
+    return R"rawliteral(
     <!DOCTYPE html>
 <html lang="pt-BR">
 <head>
